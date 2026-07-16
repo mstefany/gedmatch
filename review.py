@@ -140,16 +140,27 @@ def main(argv=None):
         print(f"\n... {len(flagged) - args.limit} more (raise --limit)")
 
     only_b = d.get("only_in_b", [])
-    attach = {}
-    for br in d.get("bridges", []):
-        for np_ in br["new_people"]:
-            anchors = ", ".join(a["name"] for a in np_.get("attaches_to", []))
-            attach[np_["b"]] = f'{np_["role"]} of {anchors}'
+    dinfo = d.get("discovery_info", {})
     print("\n" + "=" * 70)
     print(f"DISCOVERIES TO IMPORT  ({len(only_b)} in-scope new people)")
+    print("  grouped by distance from root -- import the nearest first, then")
+    print("  re-run to widen; use gedmatch --max-root-distance / --grow to phase")
     print("=" * 70)
-    for xid in only_b:
-        tail = f"   ({attach[xid]})" if xid in attach else ""
+    def sort_key(xid):
+        r = dinfo.get(xid, {})
+        return (r.get("dist") if r.get("dist") is not None else 99, xid)
+    last = object()
+    for xid in sorted(only_b, key=sort_key):
+        r = dinfo.get(xid, {})
+        dist = r.get("dist")
+        if dist != last:
+            hdr = f"distance {dist}" if dist is not None else "distance unknown"
+            print(f"\n  -- {hdr} from root --")
+            last = dist
+        if r.get("rel"):
+            tail = f"   ({r['rel']} of {r['anchor_name']} [{r['anchor_a']}])"
+        else:
+            tail = ""
         print(f"   {who(B, xid)}{tail}")
 
     # sanity check: does a "discovery" closely resemble someone already in A?

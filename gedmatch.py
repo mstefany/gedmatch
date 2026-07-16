@@ -26,9 +26,9 @@ Matching strategy:
 Pure standard library. Python 3.8+.
 """
 from __future__ import annotations
-import argparse, json, re, sys
+import argparse, json, os, re, sys
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 import heapq
 
 # ---------------------------------------------------------------- thresholds
@@ -482,18 +482,30 @@ def score_pair(a, b, ta, tb, matched):
 
 # ---------------------------------------------------------------- scope
 def blood_kindred(tree: Tree, root: str) -> set:
-    """All consanguineal relatives of root: BFS over parent/child edges only,
-    never through spouses. Yields ancestors, descendants, siblings, cousins,
-    aunts/uncles, nieces/nephews — everyone blood-related."""
+    """All consanguineal relatives of root, and NO in-laws. Two phases so a
+    spouse is never traversed through:
+      1. climb to every ancestor using PARENT edges only;
+      2. descend to every descendant of root and of each ancestor using CHILD
+         edges only -- never turning back up, which would pull in a child's
+         other parent (an in-law) and then that in-law's whole family.
+    Yields ancestors, descendants, siblings, cousins, aunts/uncles,
+    nieces/nephews. A blood relative's spouse is added later as scope, not here;
+    an in-law's own parents/siblings are correctly excluded."""
     if root not in tree.people:
         return set()
-    seen = {root}; stack = [root]
+    anc = {root}; stack = [root]                 # phase 1: ancestors (up only)
     while stack:
         x = stack.pop()
-        for r in tree.parents(x) + tree.children(x):
-            if r not in seen:
-                seen.add(r); stack.append(r)
-    return seen
+        for p in tree.parents(x):
+            if p not in anc:
+                anc.add(p); stack.append(p)
+    blood = set(anc); stack = list(anc)          # phase 2: descendants (down only)
+    while stack:
+        x = stack.pop()
+        for c in tree.children(x):
+            if c not in blood:
+                blood.add(c); stack.append(c)
+    return blood
 
 def scope_sets(tree: Tree, root: str) -> tuple[set, set]:
     """Return (blood, scope). blood = kindred; scope = blood + their spouses
@@ -700,20 +712,30 @@ class Matcher:
         return changed
 
     def _detect_b_duplicates(self):
-        """A still-unmatched B record that strongly matches an already-matched
-        A person is an Ancestry-side duplicate of that A person's real match --
-        not a discovery. Bucket by surname stem for speed."""
+        """A still-unmatched B record that is really another copy of an
+        already-matched A person -- not a discovery. Two signals:
+          * same IDENTITY on attributes alone (name + dates), scored with an
+            EMPTY matched set so siblings (who share parents) aren't mistaken
+            for duplicates; OR
+          * same NAME plus a shared MATCHED SPOUSE. Two people with the same
+            name and the same spouse are the same person -- unlike a shared
+            parent (which siblings have), a shared spouse is identity-defining.
+            This catches a duplicate whose birth/death date was mis-entered."""
         by_bucket = defaultdict(list)
         for a, b in self.matched.items():
             by_bucket[soundex(surname_stem(self.ta.people[a].surname))].append(a)
         for b in set(self.tb.people) - self.used_b:
             k = soundex(surname_stem(self.tb.people[b].surname))
+            pb = self.tb.people[b]
+            b_spouses = set(self.tb.spouses(b))
             best = None
             for a in by_bucket.get(k, []):
-                # attribute-only (empty matched set): a true duplicate is the
-                # same IDENTITY -- same name+dates -- not merely shared family,
-                # or siblings would look like duplicates of each other.
-                s, _ = score_pair(a, b, self.ta, self.tb, {})
+                s, _ = score_pair(a, b, self.ta, self.tb, {})   # attribute-only
+                if s < TAU_HIGH and given_sim(self.ta.people[a], pb) >= STRONG_GIVEN:
+                    a_spouse_b = {self.matched[sp] for sp in self.ta.spouses(a)
+                                  if sp in self.matched}
+                    if b_spouses & a_spouse_b:      # same name + same spouse
+                        s = max(s, TAU_HIGH)        # -> the same person
                 if s >= TAU_HIGH and (best is None or s > best[0]):
                     best = (s, a)
             if best:
@@ -773,6 +795,66 @@ def classify_scope_b(m: Matcher, only_b: list) -> tuple[list, list]:
             out_scope.append(b)
     return in_scope, out_scope
 
+def discovery_info(m: Matcher, roots_a: list) -> dict:
+    """For every in-scope discovery, work out (a) its graph distance from the
+    root person in B and (b) how it attaches to your EXISTING tree -- the
+    nearest matched neighbour and the relationship to it (a new 'child',
+    'parent', 'spouse' or 'sibling' of that existing person). Distance is how
+    many relationship hops separate the discovery from you; attachment is what
+    lets us phase the import (children vs ancestors) and label who each person
+    is. Returns {b_id: {dist, rel, anchor_b, anchor_a, anchor_name, name}}."""
+    tb = m.tb
+    b2a = {b: a for a, b in m.matched.items()}
+    only_b_all = sorted(set(tb.people) - m.used_b)
+    in_scope, _ = classify_scope_b(m, only_b_all)
+    in_scope = set(in_scope) - set(m.dup_b)
+
+    # BFS distance in B from the root person(s)' B-image, through all edges.
+    root_b = [m.matched[r] for r in roots_a if r in m.matched]
+    dist = {b: 0 for b in root_b}
+    dq = deque(root_b)
+    while dq:
+        x = dq.popleft()
+        for nb in (tb.parents(x) + tb.children(x)
+                   + tb.spouses(x) + tb.siblings(x)):
+            if nb not in dist:
+                dist[nb] = dist[x] + 1
+                dq.append(nb)
+
+    rank = {"child": 0, "parent": 0, "sibling": 1, "spouse": 2}
+    info = {}
+    for b in in_scope:
+        cands = []
+        for rel, nbs in (("child", tb.parents(b)),    # a matched parent  -> b is its child
+                         ("parent", tb.children(b)),   # a matched child   -> b is its parent
+                         ("spouse", tb.spouses(b)),
+                         ("sibling", tb.siblings(b))):
+            for nb in nbs:
+                if nb in m.used_b:
+                    cands.append((dist.get(nb, 10**9), rank[rel], rel, nb))
+        cands.sort()
+        p = tb.people[b]
+        rec = {"dist": dist.get(b), "name": f"{p.given} {p.surname}".strip(),
+               "rel": None, "anchor_b": None, "anchor_a": None, "anchor_name": None}
+        if cands:
+            _, _, rel, nb = cands[0]
+            an = tb.people[nb]
+            rec.update(rel=rel, anchor_b=nb, anchor_a=b2a[nb],
+                       anchor_name=f"{an.given} {an.surname}".strip())
+        info[b] = rec
+    return info
+
+def passes_phase(rec: dict, max_dist: int, grow: str) -> bool:
+    """Phase filter for a discovery given its info record: distance cap from
+    root and growth direction (down = new descendants, up = new ancestors)."""
+    if max_dist > 0 and (rec.get("dist") is None or rec["dist"] > max_dist):
+        return False
+    if grow == "down" and rec.get("rel") != "child":
+        return False
+    if grow == "up" and rec.get("rel") != "parent":
+        return False
+    return True
+
 def build_diff(m: Matcher):
     ta, tb = m.ta, m.tb
     only_a = sorted(set(ta.people) - set(m.matched))
@@ -801,6 +883,7 @@ def build_diff(m: Matcher):
             "only_in_b": in_scope_b,
             "only_in_b_out_of_scope": out_scope_b,
             "duplicates_in_b": dups,
+            "discovery_info": getattr(m, "disc_info", {}),
             "bridges": bridges, "uncertain": m.uncertain}
 
 def detect_bridges(m: Matcher, only_b: set):
@@ -836,24 +919,46 @@ def detect_bridges(m: Matcher, only_b: set):
             out.append({"family_b": fam.xid, "new_people": new_desc})
     return out
 
-def write_new_only_gedcom(m: Matcher, path: str):
-    """Emit in-scope new individuals plus the families that link them, so
-    relationships survive import without clutter. Guarantees around parents:
-      * a kept family's parents are ALWAYS emitted when they exist in the source
-        -- never a parentless family when the parents are known
-      * a parent already in your tree (matched, or reached via a duplicate
-        record) is a labelled STUB carrying its Gramps ID, so it merges
-      * a parent not in your tree is emitted as a labelled context record you
-        can review or delete
-      * a family is kept only if it links >=2 people (a lone member is dropped)
-      * children are emitted only when new; HUSB/WIFE are placed by SEX so a
-        source that swapped the couple can't create a conflicting family"""
+def write_new_only_gedcom(m: Matcher, path: str,
+                          max_root_distance: int = 0, grow: str = "both"):
+    """Emit in-scope new individuals plus the families that link them to your
+    EXISTING tree, so relationships survive import without clutter:
+      * a family is emitted only if it holds an in-tree member (matched, or a
+        duplicate of a matched person) AND a new discovery -- a discovery's
+        far-side relatives (an ancestor's own parents, an in-law's birth
+        family) are NOT dragged in
+      * in-tree members appear as merge STUBs carrying their Gramps ID: parents
+        always, and a matched child only when it's the sole anchor for new
+        siblings
+      * out-of-scope members are dropped (no pointer dangles, no non-relatives)
+      * HUSB/WIFE are placed by SEX so a source that swapped the couple can't
+        create a conflicting family
+    Phasing: max_root_distance caps how far from you a discovery may be; grow
+    ('down'=new children, 'up'=new ancestors, 'both') limits by attachment. Each
+    discovery is stamped with a NOTE giving its distance and attachment."""
     tb = m.tb
     only_b_all = sorted(set(tb.people) - m.used_b)
     in_scope_b, _ = classify_scope_b(m, only_b_all)
     new_ids = set(in_scope_b) - set(m.dup_b)
+    info = getattr(m, "disc_info", {})
+    if max_root_distance > 0 or grow != "both":   # apply the phase filter
+        new_ids = {b for b in new_ids
+                   if passes_phase(info.get(b, {}), max_root_distance, grow)}
     b2a = {b: a for a, b in m.matched.items()}
     dup_map = m.dup_b                         # b -> (kept_b, gramps_a)
+
+    def note_for(pid):                        # distance + attachment label
+        rec = info.get(pid)
+        if not rec:
+            return None
+        bits = []
+        if rec.get("dist") is not None:
+            d = rec["dist"]
+            bits.append(f"{d} step{'' if d == 1 else 's'} from root")
+        if rec.get("rel"):
+            bits.append(f"{rec['rel']} of {rec['anchor_name']} "
+                        f"[{rec['anchor_a']} in your tree]")
+        return "[gedmatch] " + "; ".join(bits) if bits else None
 
     def gref(pid):                            # Gramps id if this B person is in
         if pid in b2a:                        # your tree (matched, or a duplicate
@@ -868,35 +973,34 @@ def write_new_only_gedcom(m: Matcher, path: str):
             return m.ta.people[g].sex or tb.people[pid].sex
         return tb.people[pid].sex
 
-    # Decide which families to emit and which parents each should carry.
-    #   * A child-bearing family emits ALL its known parents so no child is
-    #     orphaned -- an out-of-scope parent comes along as a labelled context
-    #     record. Kept when it links >=2 people.
-    #   * A childless couple is worth emitting only to bridge a NEW spouse to a
-    #     spouse you already have (new or in your tree); an out-of-scope spouse
-    #     is never dragged in to complete a lone marriage.
-    fam_keep = []                             # (fam, parents_to_emit, new_children)
+    # Keep a family only when it is worth importing as a unit:
+    #   * it links a discovery to your EXISTING tree -- has an in-tree member
+    #     (matched, or a duplicate of a matched person) plus a new discovery; OR
+    #   * it is a self-contained NEW sub-family -- two or more discoveries
+    #     (e.g. a newly found parent and child who are both new).
+    # Either way it must link >=2 emitted people. Out-of-scope members are
+    # always dropped, never dragged in -- so a lone discovery's far-side
+    # relatives (a discovered ancestor's own parents, an in-law's birth family)
+    # don't come along. In-tree members appear as merge stubs: parents always,
+    # and a matched child only when it is the sole anchor for new siblings.
+    fam_keep = []            # (fam, parents_to_emit, children_to_emit)
+    stub_ids = set()
     for fam in tb.fams.values():
-        present = [x for x in (fam.husb, fam.wife) if x]
-        new_kids = [c for c in fam.chil if c in new_ids]
-        if new_kids:
-            if len(present) + len(new_kids) >= 2:
-                fam_keep.append((fam, present, new_kids))
-        else:
-            core = [x for x in present if x in new_ids or gref(x) is not None]
-            if any(x in new_ids for x in core) and len(core) >= 2:
-                fam_keep.append((fam, core, []))
-
-    # Classify every parent a kept family will carry.
-    stub_parents, context_parents = set(), set()
-    for _, parents, _ in fam_keep:
-        for p in parents:
-            if p in new_ids:
-                continue                      # a discovery -- full INDI below
-            if gref(p) is not None:
-                stub_parents.add(p)           # in your tree -> merge stub
-            else:
-                context_parents.add(p)        # not in your tree -> labelled
+        in_tree_parents = [x for x in (fam.husb, fam.wife) if x and gref(x)]
+        new_parents     = [x for x in (fam.husb, fam.wife) if x in new_ids]
+        new_children    = [c for c in fam.chil if c in new_ids]
+        in_tree_children= [c for c in fam.chil if gref(c)]
+        child_stubs = in_tree_children if (new_children and not in_tree_parents) else []
+        parents_to_emit  = in_tree_parents + new_parents
+        children_to_emit = new_children + child_stubs
+        has_in_tree = bool(in_tree_parents or child_stubs)
+        n_new = len(new_parents) + len(new_children)
+        n_emit = len(parents_to_emit) + len(children_to_emit)
+        if n_new >= 1 and n_emit >= 2 and (has_in_tree or n_new >= 2):
+            fam_keep.append((fam, parents_to_emit, children_to_emit))
+            stub_ids.update(in_tree_parents)
+            stub_ids.update(child_stubs)
+    stub_ids -= new_ids
 
     def fam_links(pid):
         out = []
@@ -919,8 +1023,11 @@ def write_new_only_gedcom(m: Matcher, path: str):
             lines += ["1 BIRT", f"2 DATE {p.birth_raw or p.birth_year}"]
         if p.death_raw or p.death_year:
             lines += ["1 DEAT", f"2 DATE {p.death_raw or p.death_year}"]
+        nt = note_for(pid)
+        if nt:
+            lines.append(f"1 NOTE {nt}")
         lines += fam_links(pid)
-    for pid in sorted(stub_parents):
+    for pid in sorted(stub_ids):
         p = tb.people[pid]; gid = gref(pid)
         dupe = " (via a duplicate record)" if pid in dup_map else ""
         lines.append(f"0 {pid} INDI")
@@ -930,18 +1037,6 @@ def write_new_only_gedcom(m: Matcher, path: str):
             lines.append(f"1 SEX {sx}")
         lines.append(f"1 REFN {gid}")
         lines.append(f"1 NOTE [gedmatch] already in your tree as {gid}{dupe} -- merge this stub")
-        lines += fam_links(pid)
-    for pid in sorted(context_parents):
-        p = tb.people[pid]
-        lines.append(f"0 {pid} INDI")
-        lines.append(f"1 NAME {p.given} /{p.surname}/")
-        if p.sex:
-            lines.append(f"1 SEX {p.sex}")
-        if p.birth_raw or p.birth_year:
-            lines += ["1 BIRT", f"2 DATE {p.birth_raw or p.birth_year}"]
-        if p.death_raw or p.death_year:
-            lines += ["1 DEAT", f"2 DATE {p.death_raw or p.death_year}"]
-        lines.append("1 NOTE [gedmatch] parent not in your tree / not matched -- review or delete")
         lines += fam_links(pid)
     for fam, parents, kids in fam_keep:
         males = [p for p in parents if sex_of(p) == "M"]
@@ -965,7 +1060,7 @@ def write_new_only_gedcom(m: Matcher, path: str):
     lines.append("0 TRLR")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
-    return len(new_ids), len(stub_parents), len(fam_keep), len(context_parents)
+    return len(new_ids), len(stub_ids), len(fam_keep), 0
 
 # --------------------------------------------------------------- review UI
 def describe_relatives(tree: Tree, pid: str, maxn: int = 5) -> str:
@@ -1007,6 +1102,57 @@ def make_cli_review(ta, tb):
 
 def auto_review(a, b, score, ev):
     return None  # non-interactive: record as uncertain, never guess
+
+def load_answers(path: str) -> dict:
+    """Load a saved decision file, tolerating a missing/corrupt file."""
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as e:
+            print(f"(could not read {path}: {e}; starting fresh)", file=sys.stderr)
+    return {}
+
+def make_cached_review(inner, ta, tb, store: dict, path: str, record: bool):
+    """Wrap a review callback so prior answers replay instead of re-prompting.
+    A decision is keyed by the id pair AND a fingerprint of both people
+    (name + birth/death years); a stored answer is reused only when that
+    fingerprint still matches, so an answer can never be misapplied if an id is
+    later reused for someone else. New answers are saved immediately (atomic
+    write) so an interrupted session keeps what you've already answered. With
+    --answers but no --interactive, cached pairs replay and everything else
+    stays uncertain (no prompts)."""
+    def fp(tree, xid):
+        p = tree.people.get(xid)
+        return "|".join([p.given or "", p.surname or "",
+                         str(p.birth_year or ""), str(p.death_year or "")]) if p else ""
+    def save():
+        if not path:
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    stats = {"recalled": 0, "asked": 0}
+    word = {True: "yes", False: "no", None: "skip"}
+    def review(a, b, score, ev):
+        key = f"{a}={b}"
+        sig = fp(ta, a) + "  #  " + fp(tb, b)
+        rec = store.get(key)
+        if rec and rec.get("sig") == sig:
+            d = rec.get("decision")
+            print(f"  [recalled: {word[d]}]  {fp(ta, a)}  =?  {fp(tb, b)}")
+            stats["recalled"] += 1
+            return d
+        d = inner(a, b, score, ev)
+        if record:
+            store[key] = {"decision": d, "sig": sig, "a": a, "b": b,
+                          "a_name": fp(ta, a), "b_name": fp(tb, b)}
+            save()
+            stats["asked"] += 1
+        return d
+    review.stats = stats
+    return review
 
 def explain_pair(m: Matcher, a: str, b: str) -> str:
     ta, tb = m.ta, m.tb
@@ -1068,6 +1214,18 @@ def main(argv=None):
                     help="with --root, blocking only considers B people within "
                     "this many family-hops of the matched set (default 2); "
                     "keeps unrelated branches of a shared tree out of the prompts")
+    ap.add_argument("--max-root-distance", type=int, default=0,
+                    help="phased import: emit only discoveries within this many "
+                    "relationship hops of the root person (0 = no cap). Import "
+                    "the inner ring, merge, re-run to widen.")
+    ap.add_argument("--grow", choices=["both", "down", "up"], default="both",
+                    help="phased import by attachment: 'down' = only new children "
+                    "of your people, 'up' = only new parents/ancestors, "
+                    "'both' = all (default)")
+    ap.add_argument("--answers", default="", help="path to a decision file: "
+                    "replay saved --interactive answers instead of re-prompting "
+                    "(and save new ones). Lets you answer the ambiguous pairs "
+                    "once and re-run freely with different --grow/--max-root-distance.")
     ap.add_argument("--out-json", default="diff.json")
     ap.add_argument("--out-ged", default="new_only.ged")
     ap.add_argument("--explain", default="", help="after matching, diagnose "
@@ -1095,6 +1253,10 @@ def main(argv=None):
               f"{len(scope_a)} incl. spouses (of {len(ta.people)} in A)")
 
     review = make_cli_review(ta, tb) if args.interactive else auto_review
+    if args.answers:
+        store = load_answers(args.answers)
+        review = make_cached_review(review, ta, tb, store, args.answers,
+                                    record=args.interactive)
     m = Matcher(ta, tb, review, blood_a=blood_a, scope_a=scope_a)
     m.scope_hops = args.scope_hops
     if args.seed:
@@ -1102,21 +1264,43 @@ def main(argv=None):
         m.seed(pairs)
     m.run(use_uid=args.use_uid, do_auto_seed=args.auto_seed)
 
+    roots_a = [r.strip() for r in args.root.split(",") if r.strip()]
+    m.disc_info = discovery_info(m, roots_a)
+
     diff = build_diff(m)
     with open(args.out_json, "w", encoding="utf-8") as fh:
         json.dump(diff, fh, indent=2, ensure_ascii=False)
-    npeople, nanchor, nfam, nctx = write_new_only_gedcom(m, args.out_ged)
+    npeople, nanchor, nfam, nctx = write_new_only_gedcom(
+        m, args.out_ged, max_root_distance=args.max_root_distance, grow=args.grow)
 
+    phase = (args.max_root_distance > 0) or (args.grow != "both")
     print(f"\nmatched:      {len(m.matched)}")
     print(f"only in A:    {len(diff['only_in_a'])}")
-    print(f"only in B:    {len(diff['only_in_b'])}  -> {args.out_ged} "
-          f"({npeople} new indi, {nfam} fam, {nanchor} anchor stubs to merge"
-          + (f", {nctx} context parents to review" if nctx else "") + ")")
+    total_b = len(diff['only_in_b'])
+    if phase:
+        lim = []
+        if args.max_root_distance > 0:
+            lim.append(f"within {args.max_root_distance} of root")
+        if args.grow != "both":
+            lim.append(f"grow={args.grow}")
+        print(f"only in B:    {total_b} in scope; this phase ({', '.join(lim)}) "
+              f"-> {args.out_ged} ({npeople} new indi, {nfam} fam, "
+              f"{nanchor} anchor stubs"
+              + (f", {nctx} context parents" if nctx else "") + ")")
+    else:
+        print(f"only in B:    {total_b}  -> {args.out_ged} "
+              f"({npeople} new indi, {nfam} fam, {nanchor} anchor stubs to merge"
+              + (f", {nctx} context parents to review" if nctx else "") + ")")
     print(f"  out of scope: {len(diff['only_in_b_out_of_scope'])}  (excluded from import)")
     print(f"  duplicates:   {len(diff['duplicates_in_b'])}  (duplicate of an already-matched person (in the imported tree))")
     print(f"conflicts:    {len(diff['conflicts'])}")
     print(f"bridges:      {len(diff['bridges'])}  (new people attached to existing)")
     print(f"uncertain:    {len(diff['uncertain'])}  (need your review)")
+    if args.answers:
+        st = getattr(review, "stats", {"recalled": 0, "asked": 0})
+        print(f"answers:      {st['recalled']} recalled"
+              + (f", {st['asked']} new" if st['asked'] else "")
+              + f"  ({args.answers})")
     print(f"wrote {args.out_json}")
 
     if args.explain:
