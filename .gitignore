@@ -1,0 +1,4 @@
+__pycache__
+*.ged
+*.csv
+*.json
