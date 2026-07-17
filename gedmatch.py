@@ -93,18 +93,47 @@ _GIVEN_MAP = _build_given_map()
 
 # ------------------------------------------------------------------- models
 @dataclass
+class GDate:
+    """A parsed GEDCOM date. year/month/day may be None; qual is one of
+    '', 'ABT', 'EST', 'CAL', 'BEF', 'AFT' (range forms collapse to their first
+    year with an approximate qualifier)."""
+    year: int | None = None
+    month: int | None = None
+    day: int | None = None
+    qual: str = ""
+    raw: str = ""
+    @property
+    def known(self) -> bool:
+        return self.year is not None
+    @property
+    def exact(self) -> bool:                 # a full, unqualified calendar date
+        return self.day is not None and self.qual == ""
+
+@dataclass
 class Person:
     xid: str
     given: str = ""
     surname: str = ""
     sex: str = ""
-    birth_year: int | None = None
+    birth_year: int | None = None            # EFFECTIVE year (birth, else bapt)
     birth_raw: str = ""
-    death_year: int | None = None
+    death_year: int | None = None            # EFFECTIVE year (death, else buri)
     death_raw: str = ""
     uid: str = ""
+    birth: GDate = field(default_factory=GDate)
+    bapt: GDate = field(default_factory=GDate)   # baptism / christening fallback
+    death: GDate = field(default_factory=GDate)
+    buri: GDate = field(default_factory=GDate)   # burial fallback
+    raw_lines: list[str] = field(default_factory=list)  # verbatim INDI subrecord
     famc: list[str] = field(default_factory=list)   # families where child
     fams: list[str] = field(default_factory=list)   # families where spouse
+
+    def eff_birth(self) -> GDate:
+        """Best available 'born about' date: birth if recorded, else the
+        baptism/christening date (Gramps-style precedence)."""
+        return self.birth if self.birth.known else self.bapt
+    def eff_death(self) -> GDate:
+        return self.death if self.death.known else self.buri
 
 @dataclass
 class Family:
@@ -160,6 +189,50 @@ class Tree:
 # ----------------------------------------------------------- gedcom parsing
 YEAR_RE = re.compile(r"\b(\d{4})\b")
 
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+_APPROX = {"ABT": "ABT", "ABOUT": "ABT", "CIRCA": "ABT", "CIR": "ABT", "C": "ABT",
+           "EST": "EST", "ESTIMATED": "EST", "CAL": "CAL", "CALCULATED": "CAL",
+           "INT": "EST", "MAYBE": "ABT", "PROB": "ABT"}
+_BOUND = {"BEF": "BEF", "BEFORE": "BEF", "AFT": "AFT", "AFTER": "AFT"}
+_RANGE = {"BET", "AND", "FROM", "TO"}          # ranges: take first year, mark ABT
+
+def parse_date(val: str) -> GDate:
+    """Parse a GEDCOM DATE value into a GDate. Tolerant of Gramps/Ancestry/MH
+    dialects: 'ABT 1872', 'BEF 12 MAR 1900', 'MAR 1978', '1978',
+    'BET 1800 AND 1810' (-> ~1800), day/month/year in any of the usual orders."""
+    raw = (val or "").strip()
+    if not raw:
+        return GDate(raw="")
+    qual = ""
+    year = month = day = None
+    saw_range = False
+    for t in raw.upper().replace(",", " ").split():
+        if t in _APPROX and not qual:
+            qual = _APPROX[t]; continue
+        if t in _BOUND and not qual:
+            qual = _BOUND[t]; continue
+        if t in _RANGE:
+            if t in ("BET", "FROM"):
+                saw_range = True
+            elif t in ("AND", "TO"):          # stop at the second bound
+                break
+            continue
+        if t in _MONTHS and month is None:
+            month = _MONTHS[t]; continue
+        if t.isdigit():
+            n = int(t)
+            if len(t) == 4 and year is None:
+                year = n
+            elif n <= 31 and day is None:
+                day = n
+            elif year is None:
+                year = n
+    if saw_range and not qual:
+        qual = "ABT"
+    return GDate(year, month, day, qual, raw)
+
 def parse_gedcom(path: str) -> Tree:
     """Structure-aware GEDCOM reader. Tracks the tag open at each level so a
     DATE is captured only when its DIRECT parent is BIRT or DEAT -- never a
@@ -204,6 +277,7 @@ def parse_gedcom(path: str) -> Tree:
                 name_open = False
 
             if kind == "INDI":
+                cur.raw_lines.append(line)    # verbatim subrecord for re-emit
                 if tag == "NAME" and level == 1:
                     if not got_name:
                         cur.given, cur.surname = split_name(val)
@@ -219,12 +293,13 @@ def parse_gedcom(path: str) -> Tree:
                 elif tag in ("_UID", "RFN", "RIN", "_FSFTID") and level == 1 \
                         and val and not cur.uid:
                     cur.uid = val.replace(" ", "").upper()
-                elif tag == "DATE" and parent in ("BIRT", "DEAT"):
-                    y = extract_year(val)
-                    if parent == "BIRT" and cur.birth_year is None and not cur.birth_raw:
-                        cur.birth_year, cur.birth_raw = y, val
-                    elif parent == "DEAT" and cur.death_year is None and not cur.death_raw:
-                        cur.death_year, cur.death_raw = y, val
+                elif tag == "DATE" and parent in ("BIRT", "DEAT", "BAPM",
+                                                  "CHR", "BURI"):
+                    gd = parse_date(val)
+                    slot = {"BIRT": "birth", "DEAT": "death", "BAPM": "bapt",
+                            "CHR": "bapt", "BURI": "buri"}[parent]
+                    if not getattr(cur, slot).raw:   # first date for this event
+                        setattr(cur, slot, gd)
                 elif tag == "FAMC" and level == 1 and val:
                     cur.famc.append(val)
                 elif tag == "FAMS" and level == 1 and val:
@@ -236,6 +311,10 @@ def parse_gedcom(path: str) -> Tree:
                     cur.wife = val
                 elif tag == "CHIL" and level == 1 and val:
                     cur.chil.append(val)
+    for p in people.values():                # effective year: birth else bapt,
+        eb, ed = p.eff_birth(), p.eff_death() # death else burial (Gramps-style)
+        p.birth_year, p.birth_raw = eb.year, eb.raw
+        p.death_year, p.death_raw = ed.year, ed.raw
     t = Tree(people, fams)
     _reconcile_links(t)
     return t
@@ -362,6 +441,45 @@ def year_score(ya, yb):
     if d <= 10: return 0.3
     return 0.0
 
+def date_score(da: GDate, db: GDate):
+    """Compare two GDates for SCORING (corroboration). None when either is
+    unknown (neutral). A matching year scores full strength; when the years
+    differ and either date is approximate or year-only, the gap is treated as
+    half as large so a fuzzy near-miss isn't punished like two exact dates.
+    (The exact-calendar-date identity signal used by the gate is separate --
+    see precise_agree.)"""
+    if not da.known or not db.known:
+        return None
+    d = abs(da.year - db.year)
+    if d == 0:
+        return 1.0
+    fuzzy = (da.qual in ("ABT", "EST", "CAL", "BEF", "AFT") or
+             db.qual in ("ABT", "EST", "CAL", "BEF", "AFT") or
+             da.day is None or db.day is None)
+    span = d / 2.0 if fuzzy else float(d)
+    if span <= 1: return 0.95
+    if span <= 2: return 0.85
+    if span <= 5: return 0.6
+    if span <= 10: return 0.3
+    return 0.0
+
+def precise_agree(da: GDate, db: GDate) -> bool:
+    """True only for identity-grade date agreement: both full, unqualified
+    calendar dates on the same day. A shared birth YEAR is common and does not
+    count -- that distinction is what stops same-year strangers auto-confirming."""
+    return (da.exact and db.exact and da.year == db.year
+            and da.month == db.month and da.day == db.day)
+
+def dates_hard_conflict(da: GDate, db: GDate) -> bool:
+    """A real contradiction worth flagging: both dates known and reasonably
+    certain (not ABT/EST/CAL/BEF/AFT) yet more than two years apart. Two
+    approximate or year-only guesses that merely differ are NOT a conflict."""
+    if not da.known or not db.known:
+        return False
+    if da.qual or db.qual:                    # any approximation -> not hard
+        return False
+    return abs(da.year - db.year) > 2
+
 def given_sim(a: Person, b: Person) -> float:
     ga, gb = canon_given(a.given), canon_given(b.given)
     if ga and ga == gb:
@@ -393,12 +511,14 @@ def attribute_score(a: Person, b: Person, ta: Tree, tb: Tree) -> tuple[float, li
     feats.append((gs, 0.30)); ev.append(f"given {a.given!r}~{b.given!r}={gs:.2f}")
     ss, sw = surname_sim(a, b, ta, tb)
     feats.append((ss, sw)); ev.append(f"surname {a.surname!r}~{b.surname!r}={ss:.2f}")
-    by = year_score(a.birth_year, b.birth_year)
+    eba, ebb = a.eff_birth(), b.eff_birth()
+    eda, edb = a.eff_death(), b.eff_death()
+    by = date_score(eba, ebb)
     if by is not None:
-        feats.append((by, 0.30)); ev.append(f"birth {a.birth_year}~{b.birth_year}={by:.2f}")
-    dy = year_score(a.death_year, b.death_year)
+        feats.append((by, 0.30)); ev.append(f"birth {eba.year}~{ebb.year}={by:.2f}")
+    dy = date_score(eda, edb)
     if dy is not None:
-        feats.append((dy, 0.10)); ev.append(f"death {a.death_year}~{b.death_year}={dy:.2f}")
+        feats.append((dy, 0.10)); ev.append(f"death {eda.year}~{edb.year}={dy:.2f}")
     if a.sex and b.sex:
         sxs = 1.0 if a.sex == b.sex else 0.0
         feats.append((sxs, 0.10)); ev.append(f"sex {a.sex}~{b.sex}={sxs:.0f}")
@@ -409,11 +529,9 @@ def attribute_score(a: Person, b: Person, ta: Tree, tb: Tree) -> tuple[float, li
     # are essentially impossible -- it's a data-entry error -- so let it match
     # and surface the sex difference as a conflict instead of vetoing.
     if a.sex and b.sex and a.sex != b.sex:
-        by = year_score(a.birth_year, b.birth_year)
-        dy2 = year_score(a.death_year, b.death_year)
         overwhelming = (given_sim(a, b) >= STRONG_GIVEN
                         and by is not None and by >= 0.85
-                        and dy2 is not None and dy2 >= 0.85)
+                        and dy is not None and dy >= 0.85)
         if overwhelming:
             ev.append("SEX MISMATCH overridden (name+both dates exact; "
                       "likely a data error -- see conflicts)")
@@ -443,41 +561,46 @@ def structural_bonus(a: str, b: str, ta: Tree, tb: Tree, matched: dict[str, str]
 
 STRONG_GIVEN = 0.85       # given-name similarity that counts as identity evidence
 
-def identity_gate(score, gs, by, dy, structural):
+def identity_gate(score, gs, by, dy, structural, precise=False):
     """Surname is corroborating, not identifying. To CONFIRM a match we need
-    real identity evidence: a matched relative, an agreeing date, or a strong
-    given-name match. by/dy are birth/death year_scores (None if a date is
-    missing on either side). Returns a possibly-capped score:
-      * structural support, or a date agreeing within ~5y -> unchanged
-      * all present dates clearly disagree (>10y), no structure -> reject
-      * no usable date, weak given, no structure -> reject (shared surname only)
-      * no usable date, strong given, no structure -> review band (ambiguous)
-    """
-    if structural > 0:
+    real identity evidence. In order of strength:
+      * a matched relative (structural), or an exact same-day date -> identity
+        established, score stands;
+      * a STRONG given name plus an agreeing date (even year-only) -> stands;
+        a strong name with no/contradicting date -> review (human judges);
+      * a weak/moderate given name with only a same-YEAR coincidence (common!)
+        and no relatives -> review, never auto-confirm (this is the case that
+        used to let same-year strangers through);
+      * shared surname only -> reject.
+    by/dy are date_scores (None if a date is missing on either side)."""
+    if structural > 0 or precise:
         return score
     present = [x for x in (by, dy) if x is not None]
-    if present:
-        best = max(present)
-        if best >= 0.6:                    # a date agrees within ~5 years
-            return score
-        if best == 0.0:                    # every present date is >10y off
-            return min(score, TAU_LOW - 0.01)
-        # 6-10y gap: too weak to rely on; fall through to the name test
+    best = max(present) if present else None
     if gs >= STRONG_GIVEN:
-        return min(score, TAU_HIGH - 0.01)   # plausible, not certain -> review
-    return min(score, TAU_LOW - 0.01)        # surname only -> reject
+        if best is not None and best >= 0.6:      # strong name + agreeing date
+            return score
+        return min(score, TAU_HIGH - 0.01)        # strong name alone -> review
+    # weak/moderate given name, no structural support, no exact date:
+    if best is not None and best >= 0.6:
+        return min(score, TAU_HIGH - 0.01)        # only a loose date -> review
+    return min(score, TAU_LOW - 0.01)             # nothing identifying -> reject
 
 def score_pair(a, b, ta, tb, matched):
     pa, pb = ta.people[a], tb.people[b]
     base, ev = attribute_score(pa, pb, ta, tb)
     sb, sev = structural_bonus(a, b, ta, tb, matched)
     raw = min(1.0, base + sb)
+    eba, ebb = pa.eff_birth(), pb.eff_birth()
+    eda, edb = pa.eff_death(), pb.eff_death()
+    precise = precise_agree(eba, ebb) or precise_agree(eda, edb)
     gated = identity_gate(raw, given_sim(pa, pb),
-                          year_score(pa.birth_year, pb.birth_year),
-                          year_score(pa.death_year, pb.death_year), sb)
+                          date_score(eba, ebb), date_score(eda, edb),
+                          sb, precise)
     ev = ev + sev
     if gated < raw - 1e-9:
-        ev = ev + [f"gated {raw:.2f}->{gated:.2f} (surname-only, no date/relative)"]
+        ev = ev + [f"gated {raw:.2f}->{gated:.2f} (weak identity: no relative, "
+                   f"no strong name, no exact date)"]
     return gated, ev
 
 # ---------------------------------------------------------------- scope
@@ -776,6 +899,60 @@ class Matcher:
         ]
 
 # ------------------------------------------------------------------- output
+_LINE_RE = re.compile(r"^(\d+)\s+(?:@[^@]+@\s+)?(\S+)(?:\s(.*))?$")
+_PTR_RE = re.compile(r"^@[^@]+@$")
+
+def full_indi_lines(p: Person, extra_note: str, links: list[str]) -> list[str]:
+    """Re-emit a discovered person's FULL record from B (events, places, inline
+    notes, occupation, etc.) so nothing is lost on import -- not just the
+    name/dates skeleton. Two things are stripped for safety:
+      * FAMS/FAMC pointers (the tool rewrites family links itself); and
+      * any line whose value is a cross-record pointer (SOUR/OBJE/NOTE-@N@/
+        SUBM/ASSO ...), together with its sub-lines, since those target records
+        we don't emit and would dangle on import.
+    Inline data (values that aren't bare @xref@ pointers) is kept verbatim."""
+    out = [f"0 {p.xid} INDI"]
+    skip_below = None
+    for ln in p.raw_lines:
+        m = _LINE_RE.match(ln)
+        if not m:
+            continue
+        lvl = int(m.group(1)); tag = m.group(2); val = (m.group(3) or "").strip()
+        if skip_below is not None:
+            if lvl > skip_below:
+                continue                 # inside a dropped subtree
+            skip_below = None
+        if tag in ("FAMC", "FAMS") or _PTR_RE.match(val):
+            skip_below = lvl             # drop this line and its children
+            continue
+        out.append(ln)
+    if extra_note:
+        out.append(f"1 NOTE {extra_note}")
+    out += links
+    return out
+
+def apply_ignore(tree: Tree, patterns: set) -> set:
+    """Drop placeholder / to-be-ignored people (matched by given-name token,
+    case- and diacritic-insensitive) and scrub every reference to them, so they
+    never match, fall in scope, or reach new_only.ged. Runs BEFORE anything
+    else. Returns the set of dropped ids. Used for records like 'Private',
+    'Living', or unnamed child stubs the other tree shouldn't import."""
+    if not patterns:
+        return set()
+    pats = {norm(p) for p in patterns if norm(p)}
+    drop = {pid for pid, per in tree.people.items()
+            if first_token(per.given) in pats or norm(per.given) in pats}
+    for pid in drop:
+        del tree.people[pid]
+    for fam in tree.fams.values():
+        if fam.husb in drop: fam.husb = ""
+        if fam.wife in drop: fam.wife = ""
+        fam.chil = [c for c in fam.chil if c not in drop]
+    for per in tree.people.values():
+        per.famc = [f for f in per.famc if f in tree.fams]
+        per.fams = [f for f in per.fams if f in tree.fams]
+    return drop
+
 def classify_scope_b(m: Matcher, only_b: list) -> tuple[list, list]:
     """Split only-in-B people into in-scope (a real discovery to import) vs
     out-of-scope (e.g. an in-law's ancestors/siblings we don't want).
@@ -869,9 +1046,13 @@ def build_diff(m: Matcher):
     conflicts = []
     for a, b in m.matched.items():
         pa, pb = ta.people[a], tb.people[b]
-        for fld, va, vb in (("birth_year", pa.birth_year, pb.birth_year),
-                            ("death_year", pa.death_year, pb.death_year),
-                            ("surname", pa.surname, pb.surname),
+        if dates_hard_conflict(pa.eff_birth(), pb.eff_birth()):
+            conflicts.append({"a": a, "b": b, "field": "birth_year",
+                              "a_val": pa.birth_year, "b_val": pb.birth_year})
+        if dates_hard_conflict(pa.eff_death(), pb.eff_death()):
+            conflicts.append({"a": a, "b": b, "field": "death_year",
+                              "a_val": pa.death_year, "b_val": pb.death_year})
+        for fld, va, vb in (("surname", pa.surname, pb.surname),
                             ("sex", pa.sex, pb.sex)):
             if va and vb and va != vb:
                 conflicts.append({"a": a, "b": b, "field": fld,
@@ -1014,19 +1195,7 @@ def write_new_only_gedcom(m: Matcher, path: str,
     lines = ["0 HEAD", "1 SOUR gedmatch", "1 GEDC", "2 VERS 5.5.1",
              "2 FORM LINEAGE-LINKED", "1 CHAR UTF-8"]
     for pid in sorted(new_ids):
-        p = tb.people[pid]
-        lines.append(f"0 {pid} INDI")
-        lines.append(f"1 NAME {p.given} /{p.surname}/")
-        if p.sex:
-            lines.append(f"1 SEX {p.sex}")
-        if p.birth_raw or p.birth_year:
-            lines += ["1 BIRT", f"2 DATE {p.birth_raw or p.birth_year}"]
-        if p.death_raw or p.death_year:
-            lines += ["1 DEAT", f"2 DATE {p.death_raw or p.death_year}"]
-        nt = note_for(pid)
-        if nt:
-            lines.append(f"1 NOTE {nt}")
-        lines += fam_links(pid)
+        lines += full_indi_lines(tb.people[pid], note_for(pid), fam_links(pid))
     for pid in sorted(stub_ids):
         p = tb.people[pid]; gid = gref(pid)
         dupe = " (via a duplicate record)" if pid in dup_map else ""
@@ -1139,13 +1308,15 @@ def make_cached_review(inner, ta, tb, store: dict, path: str, record: bool):
         key = f"{a}={b}"
         sig = fp(ta, a) + "  #  " + fp(tb, b)
         rec = store.get(key)
-        if rec and rec.get("sig") == sig:
-            d = rec.get("decision")
+        # Only reuse a definitive yes/no. A 'skip' means "ask me again", so a
+        # stored None (from this or an older file) is treated as not-yet-decided.
+        if rec and rec.get("sig") == sig and rec.get("decision") is not None:
+            d = rec["decision"]
             print(f"  [recalled: {word[d]}]  {fp(ta, a)}  =?  {fp(tb, b)}")
             stats["recalled"] += 1
             return d
         d = inner(a, b, score, ev)
-        if record:
+        if record and d is not None:              # persist decisions, not skips
             store[key] = {"decision": d, "sig": sig, "a": a, "b": b,
                           "a_name": fp(ta, a), "b_name": fp(tb, b)}
             save()
@@ -1226,6 +1397,12 @@ def main(argv=None):
                     "replay saved --interactive answers instead of re-prompting "
                     "(and save new ones). Lets you answer the ambiguous pairs "
                     "once and re-run freely with different --grow/--max-root-distance.")
+    ap.add_argument("--ignore", default="Private,Living",
+                    help="comma-separated given-name tokens to ignore entirely "
+                    "(default 'Private,Living'). People whose given name matches "
+                    "are dropped from BOTH trees before matching/scope/emission, "
+                    "so placeholder or hidden-living records never reach "
+                    "new_only.ged. Pass '' to disable.")
     ap.add_argument("--out-json", default="diff.json")
     ap.add_argument("--out-ged", default="new_only.ged")
     ap.add_argument("--explain", default="", help="after matching, diagnose "
@@ -1236,6 +1413,13 @@ def main(argv=None):
     tb = parse_gedcom(args.gedcom_b)
     print(f"A: {len(ta.people)} people / {len(ta.fams)} families")
     print(f"B: {len(tb.people)} people / {len(tb.fams)} families")
+
+    ign = {p.strip() for p in args.ignore.split(",") if p.strip()}
+    if ign:
+        da, db = apply_ignore(ta, ign), apply_ignore(tb, ign)
+        if da or db:
+            print(f"ignored: {len(da)} in A, {len(db)} in B "
+                  f"(given name in {sorted(ign)})")
 
     blood_a = scope_a = None
     if args.root:

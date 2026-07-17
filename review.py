@@ -15,7 +15,7 @@ It also lays out discoveries (with how each attaches), exclusions, and the
 uncertain queue -- showing close relatives for dateless cases so you can judge.
 
 Usage:
-  python3 review.py diff.json --ged-a gramps.ged --ged-b ancestry.ged
+  python3 review.py diff.json --ged-a A.ged --ged-b B.ged
   python3 review.py diff.json --ged-a A.ged --ged-b B.ged --csv flagged.csv
 """
 import argparse, csv, json, re, sys
@@ -204,7 +204,7 @@ def main(argv=None):
     if dups:
         print("\n" + "=" * 70)
         print(f"DUPLICATES IN THE IMPORTED TREE  ({len(dups)}) -- NOT imported; "
-              "consider merging in Ancestry")
+              "consider merging them in GEDCOM B's source app")
         print("=" * 70)
         for x in dups:
             print(f"   {who(B, x['b'])}  ==  already matched via {x['duplicate_of_b']}")
