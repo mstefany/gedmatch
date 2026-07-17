@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gedmatch"
+version = "0.1.0"
+description = "Reconcile two GEDCOM exports where IDs are not trustworthy"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-v"
+testpaths = [
+    "tests",
+]

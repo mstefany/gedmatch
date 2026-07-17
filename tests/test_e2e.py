@@ -36,14 +36,7 @@ _FAIL = 0
 
 
 def ok(name, cond, detail=""):
-    global _PASS, _FAIL
-    if cond:
-        _PASS += 1
-        if VERBOSE:
-            print(f"  PASS  {name}")
-    else:
-        _FAIL += 1
-        print(f"  FAIL  {name}   {detail}")
+    assert cond, f"{name}: {detail}"
 
 
 def fx(fname):

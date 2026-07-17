@@ -263,11 +263,11 @@ per-feature scores, the structural bonus, and the final verdict for any pair.
 ## Testing
 
 ```bash
-python3 tests/run_tests.py        # run the whole suite
-python3 tests/run_tests.py -v     # print every passing check too
+pytest        # run the whole suite (unit + E2E tests)
+pytest -v     # print every passing check too
 ```
 
-The suite (`tests/run_tests.py`, 57 checks) has two layers:
+The suite (17 tests covering unit behavior and 57 E2E checks) has two layers:
 
 - **Regression** — the canonical match / uncertain / duplicate counts for every
   fixture pair in `tests/fixtures/`, so a change that silently alters matching
