@@ -1,4 +1,6 @@
 __pycache__
-*.ged
 *.csv
 *.json
+Ancestry*
+MyHeritage*
+Gramps

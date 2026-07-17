@@ -1,0 +1,22 @@
+0 HEAD
+1 CHAR UTF-8
+0 @R@ INDI
+1 NAME Me /Stephany/
+1 SEX M
+1 BIRT
+2 DATE 1970
+0 @H@ INDI
+1 NAME Michael /Stephany/
+1 SEX M
+1 BIRT
+2 DATE 1840
+0 @W@ INDI
+1 NAME Sophia /Mager/
+1 SEX F
+1 BIRT
+2 DATE 1845
+0 @FHW@ FAM
+1 HUSB @H@
+1 WIFE @W@
+1 CHIL @R@
+0 TRLR

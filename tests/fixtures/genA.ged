@@ -1,0 +1,24 @@
+0 HEAD
+1 CHAR UTF-8
+0 @S1@ INDI
+1 NAME Samuel S /Suznevich/
+1 SEX M
+1 BIRT
+2 DATE 1894
+1 DEAT
+2 DATE 1988
+0 @P2@ INDI
+1 NAME Peter Carol /Suznevich/
+1 SEX M
+1 BIRT
+2 DATE 1920
+0 @S3@ INDI
+1 NAME Sam /Suznevich/
+1 SEX M
+0 @FS1@ FAM
+1 HUSB @S1@
+1 CHIL @P2@
+0 @FS2@ FAM
+1 HUSB @P2@
+1 CHIL @S3@
+0 TRLR

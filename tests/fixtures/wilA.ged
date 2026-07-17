@@ -1,0 +1,15 @@
+0 HEAD
+0 @W@ INDI
+1 NAME William /Olson/
+1 SEX M
+1 BIRT
+2 DATE ABT 1872
+1 DEAT
+2 DATE 1946
+0 @S@ INDI
+1 NAME Susanna /Pudleiner/
+1 SEX F
+0 @F@ FAM
+1 HUSB @W@
+1 WIFE @S@
+0 TRLR

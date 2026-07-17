@@ -1,0 +1,40 @@
+0 HEAD
+0 @XR@ INDI
+1 NAME Me /Test/
+1 SEX M
+1 BIRT
+2 DATE 1980
+0 @XP@ INDI
+1 NAME Otec /Test/
+1 SEX M
+1 BIRT
+2 DATE 1950
+0 @NK@ INDI
+1 NAME Novy /Test/
+1 SEX M
+1 BIRT
+2 DATE 12 MAR 2010
+2 PLAC Bratislava, Slovakia
+1 CHR
+2 DATE 20 MAR 2010
+1 OCCU Engineer
+1 RESI
+2 PLAC Kosice
+1 NOTE Inline biography note about Novy.
+1 SOUR @S1@
+2 PAGE 42
+1 FAMC @FB@
+0 @PRIV@ INDI
+1 NAME Private /Test/
+1 SEX F
+0 @KID@ INDI
+1 NAME kind /Test/
+0 @S1@ SOUR
+1 TITL Church book
+0 @FB@ FAM
+1 HUSB @XP@
+1 CHIL @XR@
+1 CHIL @NK@
+1 CHIL @PRIV@
+1 CHIL @KID@
+0 TRLR
