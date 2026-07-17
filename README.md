@@ -159,16 +159,23 @@ William Olson  b.ABT 1895              (same spouse in B)
 
 ## The ignore list
 
-`--ignore` (default `Private,Living`) drops people whose given name matches one
-of the listed tokens — case- and diacritic-insensitive — from **both** trees,
-*before* matching, scoping, and emission. This removes the placeholder records
-exports are full of (living people hidden as `Private`, unnamed `kind`/child
-stubs) so they never surface as bogus "discoveries" in `new_only.ged`.
+`--ignore` (default `Private,Living`) drops the listed people from **both**
+trees, *before* matching, scoping, and emission. This removes the placeholder
+records exports are full of (living people hidden as `Private`, unnamed
+`kind`/child stubs) so they never surface as bogus "discoveries" in
+`new_only.ged`. Each comma-separated pattern is either:
+
+- **a record id** — `@I5@` drops exactly that person. Because the two trees
+  have independent id spaces, prefix with the tree letter (`A:@I5@`,
+  `B:@X12@`) to target just one of them; a bare id is dropped from whichever
+  tree(s) contain it.
+- **a given-name token** — anything else drops everyone whose given name
+  matches it, case- and diacritic-insensitive.
 
 ```bash
 python3 gedmatch.py A.ged B.ged --root "@I1@" --seed "@I1@=@X1@" \
-        --ignore "Private,Living,kind"
-# -> ignored: 0 in A, 2 in B (given name in ['Living', 'Private', 'kind'])
+        --ignore "Private,Living,B:@KID@"
+# -> ignored: 0 in A, 2 in B (matching ['B:@KID@', 'Living', 'Private'])
 ```
 
 Pass `--ignore ""` to disable.
@@ -249,7 +256,8 @@ options:
   --grow {both,down,up}   phased import by attachment type (def both)
   --interactive           prompt on ambiguous pairs
   --answers FILE          replay/save interactive yes/no decisions
-  --ignore "A,B,..."      given-name tokens to drop entirely (def Private,Living)
+  --ignore "X,Y,..."      record ids (@I5@, A:@I5@, B:@X5@) and given-name
+                          tokens to drop entirely (def Private,Living)
   --explain Aid=Bid,...   diagnose why specific pairs did/didn't match
   --out-json FILE         default diff.json
   --out-ged FILE          default new_only.ged
@@ -332,6 +340,6 @@ gedmatch/
 - **The spouse-corroborated duplicate rule** could, in principle, misflag a
   genuine remarriage to an identically-named different person. This is
   astronomically rare and always visible in the duplicates list for review.
-- **Nameless records are not auto-ignored** by default — only explicit name
+- **Nameless records are not auto-ignored** by default — only explicit ignore
   patterns — so a nameless but structurally important linking ancestor is never
   dropped silently.

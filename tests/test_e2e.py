@@ -172,6 +172,24 @@ def test_items_23_7_ignore_and_full_transfer():
         ok(f"discovery keeps {want!r}", want in nk, "missing from @NK@")
     ok("source pointer dropped", "@S1@" not in nk and "PAGE 42" not in nk)
 
+    # same placeholders dropped by record id (bare and B:-prefixed) instead
+    # of by given-name token
+    out, _, ged = run([fx("fullA.ged"), fx("fullB.ged"), "--root", "@R@",
+                       "--seed", "@R@=@XR@"],
+                      extra=["--ignore", "@PRIV@,B:@KID@"])
+    ok("2 placeholders ignored by id in B", "ignored: 0 in A, 2 in B" in out,
+       out.strip().splitlines()[:3])
+    ok("id-ignored placeholders absent from new_only.ged",
+       not re.search(r"Private|kind|@PRIV@|@KID@", ged))
+
+    # an A:-prefixed id must not touch B even if B has that id
+    out, _, ged = run([fx("fullA.ged"), fx("fullB.ged"), "--root", "@R@",
+                       "--seed", "@R@=@XR@"],
+                      extra=["--ignore", "A:@PRIV@"])
+    ok("A:-prefixed id leaves B alone", "ignored:" not in out,
+       out.strip().splitlines()[:3])
+    ok("B placeholder still emitted without ignore", "@PRIV@" in ged)
+
 
 def test_item5_answer_cache_skip():
     """A 'skip' is never cached (asked again next run); a definitive yes/no is

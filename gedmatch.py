@@ -931,17 +931,32 @@ def full_indi_lines(p: Person, extra_note: str, links: list[str]) -> list[str]:
     out += links
     return out
 
-def apply_ignore(tree: Tree, patterns: set) -> set:
-    """Drop placeholder / to-be-ignored people (matched by given-name token,
-    case- and diacritic-insensitive) and scrub every reference to them, so they
-    never match, fall in scope, or reach new_only.ged. Runs BEFORE anything
-    else. Returns the set of dropped ids. Used for records like 'Private',
-    'Living', or unnamed child stubs the other tree shouldn't import."""
+def apply_ignore(tree: Tree, patterns: set, side: str = "") -> set:
+    """Drop placeholder / to-be-ignored people and scrub every reference to
+    them, so they never match, fall in scope, or reach new_only.ged. Runs
+    BEFORE anything else. Two kinds of pattern: a record id ('@I5@'; prefix
+    'A:' or 'B:' to target only that tree, since the trees' id spaces can
+    collide) drops exactly that person, and any other token drops everyone
+    whose given name matches it (case- and diacritic-insensitive). Returns
+    the set of dropped ids. Used for records like 'Private', 'Living', or
+    unnamed child stubs the other tree shouldn't import."""
     if not patterns:
         return set()
-    pats = {norm(p) for p in patterns if norm(p)}
+    ids, names = set(), set()
+    for p in patterns:
+        tgt, sep, rest = p.partition(":")
+        if sep and tgt.upper() in ("A", "B"):
+            if tgt.upper() != side:
+                continue
+            p = rest
+        if p.startswith("@") and p.endswith("@") and len(p) > 2:
+            ids.add(p)
+        elif p:
+            names.add(p)
+    pats = {norm(p) for p in names if norm(p)}
     drop = {pid for pid, per in tree.people.items()
-            if first_token(per.given) in pats or norm(per.given) in pats}
+            if pid in ids
+            or first_token(per.given) in pats or norm(per.given) in pats}
     for pid in drop:
         del tree.people[pid]
     for fam in tree.fams.values():
@@ -1398,11 +1413,13 @@ def main(argv=None):
                     "(and save new ones). Lets you answer the ambiguous pairs "
                     "once and re-run freely with different --grow/--max-root-distance.")
     ap.add_argument("--ignore", default="Private,Living",
-                    help="comma-separated given-name tokens to ignore entirely "
-                    "(default 'Private,Living'). People whose given name matches "
-                    "are dropped from BOTH trees before matching/scope/emission, "
-                    "so placeholder or hidden-living records never reach "
-                    "new_only.ged. Pass '' to disable.")
+                    help="comma-separated patterns to ignore entirely "
+                    "(default 'Private,Living'). A record id like '@I5@' drops "
+                    "exactly that person (prefix 'A:@I5@'/'B:@X5@' to target "
+                    "one tree); any other token drops people whose given name "
+                    "matches it. Applied to BOTH trees before matching/scope/"
+                    "emission, so placeholder or hidden-living records never "
+                    "reach new_only.ged. Pass '' to disable.")
     ap.add_argument("--out-json", default="diff.json")
     ap.add_argument("--out-ged", default="new_only.ged")
     ap.add_argument("--explain", default="", help="after matching, diagnose "
@@ -1416,10 +1433,10 @@ def main(argv=None):
 
     ign = {p.strip() for p in args.ignore.split(",") if p.strip()}
     if ign:
-        da, db = apply_ignore(ta, ign), apply_ignore(tb, ign)
+        da, db = apply_ignore(ta, ign, "A"), apply_ignore(tb, ign, "B")
         if da or db:
             print(f"ignored: {len(da)} in A, {len(db)} in B "
-                  f"(given name in {sorted(ign)})")
+                  f"(matching {sorted(ign)})")
 
     blood_a = scope_a = None
     if args.root:
